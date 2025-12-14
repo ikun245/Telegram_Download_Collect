@@ -28,7 +28,7 @@ ddtg/
 
 ### 1. 前置要求
 - Python 3.10+
-- Telegram API ID 和 Hash (获取地址: https://my.telegram.org)
+- Telegram API ID 和 Hash (获取地址:  https://my.telegram.org)
 
 ### 2. 安装依赖
 ```bash
