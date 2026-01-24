@@ -3,8 +3,9 @@ import os
 import sys
 import json
 import yaml
+import re # Added for sanitization
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta # Added timezone
 from telethon import TelegramClient, events, types
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, DocumentAttributeFilename
 from tqdm import tqdm
@@ -22,8 +23,8 @@ def print_banner():
  | |_| | (_) \ V  V /| | | | | (_) | (_| | (_| | | || |_| |
  |____/ \___/ \_/\_/ |_| |_|_|\___/ \__,_|\__,_| |_| \____|
                    
- DownloadTG
- Author: @ikun245
+ DownloadTG - Refactored
+ Author: @ikun245 / Copilot
     """)
 
 config = load_config()
@@ -46,213 +47,322 @@ session_file = '../output/anon'
 
 client = TelegramClient(session_file, api_id, api_hash, proxy=proxy)
 
-async def download_media_safe(client, message, output_dir, semaphore):
-    async with semaphore:
-        try:
-            fname = "media"
-            if message.file and message.file.name:
-                fname = message.file.name
-            elif message.file and message.file.ext:
-                fname = f"{message.id}{message.file.ext}"
-            
-            file_size = message.file.size if message.file else 0
-            
-            # Use tqdm for real-time progress bar
-            # position=0 to let tqdm handle multiple bars automatically (best effort)
-            with tqdm(total=file_size, unit='B', unit_scale=True, desc=f"Msg {message.id} ({fname})", leave=False) as pbar:
-                def progress_callback(current, total):
-                    pbar.total = total
-                    pbar.update(current - pbar.n)
+def sanitize_filename(name):
+    """Sanitize directory/file names by removing illegal characters."""
+    if not name:
+        return ""
+    # Replace invalid characters for Windows/Linux filesystems
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    # Remove control characters
+    name = re.sub(r'[\x00-\x1f]', '', name)
+    # Limit length to avoid path parsing errors (max 255 usually, use safer limit)
+    return name[:100].strip()
 
-                path = await client.download_media(
-                    message, 
-                    file=output_dir,
-                    progress_callback=progress_callback
-                )
-            return path
+async def process_media_group(client, messages, base_output_dir, semaphore):
+    """
+    Process a group of messages (album or single).
+    Creates a folder based on description and downloads content.
+    """
+    if not messages:
+        return
+
+    # 1. Determine Description and Date
+    # Sort messages by ID to ensure consistency
+    messages.sort(key=lambda m: m.id)
+    main_msg = messages[0] # taking the first one for ID/Date reference
+    
+    # Combine text from all messages in the group or prioritize the longest/first
+    description_text = ""
+    for m in messages:
+        if m.message:
+            description_text = m.message
+            break # usually only one caption in an album, or we take the first found
+            
+    # Fallback description if empty
+    safe_desc = sanitize_filename(description_text)
+    if not safe_desc:
+        safe_desc = f"{main_msg.date.strftime('%Y-%m-%d')}_Msg{main_msg.id}"
+    
+    # Create valid folder name: "Text..."
+    # Ensure uniqueness? If messages are strictly processed, ID overlap isn't an issue 
+    # but description might be same for different days.
+    # User asked: "every day video group (message) create a new folder named description info"
+    # We will use the sanitized description.
+    
+    group_folder = os.path.join(base_output_dir, safe_desc)
+    
+    # Handle duplicate folder names by appending ID if it exists and is not this group
+    # (Simplified: just append ID to folder name to be safe if desired, but user specifically asked for "named description info")
+    # A safe compromise: Description_ID if duplicates occur? 
+    # Let's simple check if exists. The user might want to merge, but let's assume separate events.
+    # To be "safe" and distinct:
+    # group_folder = os.path.join(base_output_dir, f"{safe_desc}_{main_msg.id}") 
+    # But user asked strictly for "naming description info". 
+    # I will attempt to use description.
+    
+    if not os.path.exists(group_folder):
+        os.makedirs(group_folder, exist_ok=True)
+        
+    # 2. Save Description
+    if description_text:
+        try:
+            with open(os.path.join(group_folder, "description.txt"), "w", encoding="utf-8") as f:
+                f.write(description_text)
         except Exception as e:
-            print(f"\n[Error] Failed to download message {message.id}: {e}")
-            return None
+            print(f"Error saving description: {e}")
+
+    # 3. Download Media
+    tasks = []
+    
+    async def _download_one(msg):
+        if not msg.media:
+            return
+            
+        async with semaphore:
+            try:
+                # Construct filename
+                # If it's a file, try msg.file.name, else derived
+                fname = "media"
+                if msg.file:
+                    if hasattr(msg.file, 'name') and msg.file.name:
+                        fname = msg.file.name
+                    elif hasattr(msg.file, 'ext'):
+                        fname = f"{msg.id}{msg.file.ext}"
+                    else:
+                        fname = f"{msg.id}.unknown" # fallback
+                else:
+                    fname = f"{msg.id}.unknown"
+                
+                # Sanitize fname
+                fname = sanitize_filename(fname)
+                if not fname:
+                    fname = f"{msg.id}.bin"
+                    
+                out_path = os.path.join(group_folder, fname)
+
+                # Get expected size
+                expected_size = msg.file.size if (msg.file and hasattr(msg.file, 'size')) else 0
+                
+                # Check existing file
+                if os.path.exists(out_path):
+                    stat = os.stat(out_path)
+                    if expected_size > 0 and stat.st_size == expected_size:
+                        # Already downloaded fully
+                        return
+                    else:
+                        # Incomplete or different size, remove and redownload
+                        # print(f"Redownloading {fname} (Size mismatch: {stat.st_size}/{expected_size})")
+                        try:
+                            os.remove(out_path)
+                        except OSError:
+                            pass
+
+                # Retry loop
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        desc_str = f"Msg {msg.id}"
+                        # Ensure directory exists before downloading
+                        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                        
+                        with tqdm(total=expected_size, unit='B', unit_scale=True, desc=desc_str, leave=False) as pbar:
+                            def progress_callback(current, total):
+                                pbar.total = total
+                                pbar.update(current - pbar.n)
+
+                            await client.download_media(
+                                msg, 
+                                file=out_path,
+                                progress_callback=progress_callback
+                            )
+                        
+                        # Verify size after download
+                        if os.path.exists(out_path):
+                            stat = os.stat(out_path)
+                            if expected_size > 0 and stat.st_size == expected_size:
+                                break # Success
+                            elif expected_size == 0 and stat.st_size > 0:
+                                break # Success (we didn't know expected size)
+                            else:
+                                if attempt < max_retries - 1:
+                                    # Only log warning if we are going to retry
+                                    # print(f"\n[Warn] Size mismatch after download {fname}. Retrying...")
+                                    try: os.remove(out_path)
+                                    except: pass
+                        else:
+                             if attempt < max_retries - 1:
+                                 pass # Retry if file not found
+                        
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2) # Wait before retry
+                        else:
+                            print(f"\n[Error] Failed Msg {msg.id} after {max_retries} attempts: {e}")
+
+            except Exception as e:
+                print(f"[Error] Critical error processing Msg {msg.id}: {e}")
+
+    for m in messages:
+        tasks.append(_download_one(m))
+        
+    if tasks:
+        await asyncio.gather(*tasks)
 
 async def main():
     print("Connecting to Telegram via Python...")
     await client.start(phone=phone)
     print("Successfully logged in!")
 
-    # 1. Select Dialog
-    dialogs = []
-    print("\nFetching dialogs...")
-    async for d in client.iter_dialogs(limit=20):
-        dialogs.append(d)
-        print(f"[{len(dialogs)}] {d.name} (ID: {d.id})")
-
-    choice = input("Select chat (number): ")
-    if not choice.isdigit() or int(choice) < 1 or int(choice) > len(dialogs):
-        print("Invalid selection.")
+    # 1. Input: Link
+    target_link = input("\nEnter Target Telegram Link (e.g. https://t.me/channel_name or username): ").strip()
+    
+    # 2. Input: Dates
+    start_date_str = input("Enter Start Date (YYYY-MM-DD): ").strip()
+    end_date_str = input("Enter End Date (YYYY-MM-DD): ").strip()
+    
+    start_date = None
+    end_date = None
+    
+    try:
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        # End date: end of that day
+        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+    except ValueError:
+        print("Invalid date format. Please use YYYY-MM-DD.")
         return
 
-    target = dialogs[int(choice)-1]
-    print(f"Selected: {target.name}")
+    # 3. Resolve Entity
+    print(f"Resolving {target_link}...")
+    try:
+        entity = await client.get_entity(target_link)
+        print(f"Target found: {entity.title if hasattr(entity, 'title') else entity.username} (ID: {entity.id})")
+    except Exception as e:
+        print(f"Error resolving entity: {e}")
+        return
 
-    # 2. Fetch Messages
-    print("\nSelect Fetch Mode:")
-    print("1. Earliest (Fetch all history from beginning)")
-    print("2. From Date (Fetch messages after a specific date)")
-    print("3. From Message ID (Fetch messages after a specific ID)")
-    print("4. Latest (Fetch latest N messages)")
+    # 4. Fetch Messages
+    print(f"\nFetching messages from {start_date.date()} to {end_date.date()}...")
     
-    mode_choice = input("Select mode (1-4): ")
+    found_messages = []
+    # Using reverse=True means iterating from oldest to newest. 
+    # offset_date in iter_messages behavior:
+    # If reverse=True, offset_date is the starting point in time (going forward).
     
-    iter_args = {'entity': target}
-    start_type = "unknown"
+    try:
+        async for msg in client.iter_messages(entity, offset_date=start_date, reverse=True):
+            if msg.date > end_date:
+                break
+            
+            # Simple check to ensure we are >= start_date (offset_date handles this mostly, but good to be safe)
+            if msg.date < start_date: 
+                continue 
+                
+            found_messages.append(msg)
+            if len(found_messages) % 100 == 0:
+                print(f"Found {len(found_messages)}...", end='\r')
+                
+    except Exception as e:
+        print(f"\nError fetching messages: {e}")
+        return
 
-    if mode_choice == '1':
-        start_type = 'earliest'
-        iter_args['reverse'] = True
-        print("Mode: Earliest (All history)")
-        
-    elif mode_choice == '2':
-        start_type = 'date'
-        iter_args['reverse'] = True
-        date_str = input("Enter start date (YYYY-MM-DD): ")
-        try:
-            # Basic parsing
-            if 'T' not in date_str and ' ' not in date_str:
-                date_str += "T00:00:00"
-            dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-            iter_args['offset_date'] = dt
-            print(f"Starting from date: {dt}")
-        except ValueError as e:
-            print(f"Error parsing date: {e}")
-            return
+    print(f"\nTotal messages found in range: {len(found_messages)}")
+    if not found_messages:
+        print("No messages found in the specified range.")
+        return
 
-    elif mode_choice == '3':
-        start_type = 'message_id'
-        iter_args['reverse'] = True
-        msg_id = input("Enter start Message ID: ")
-        if msg_id.isdigit():
-            iter_args['min_id'] = int(msg_id)
-            print(f"Starting from Message ID: {msg_id}")
+    # 5. Grouping Logic
+    # Group messages by grouped_id (Albums)
+    # Messages without grouped_id are treated as single-item groups
+    
+    groups = {} # grouped_id -> [msg]
+    singles = [] # list of [msg] (each is a list of 1)
+    
+    for msg in found_messages:
+        if msg.grouped_id:
+            if msg.grouped_id not in groups:
+                groups[msg.grouped_id] = []
+            groups[msg.grouped_id].append(msg)
         else:
-            print("Invalid Message ID")
-            return
-
-    elif mode_choice == '4':
-        start_type = 'latest'
-        limit_str = input("Enter limit (default 100): ")
-        limit = int(limit_str) if limit_str.isdigit() else 100
-        iter_args['limit'] = limit
-        print(f"Fetching latest {limit} messages")
-
-    else:
-        print("Invalid selection. Defaulting to latest 100.")
-        iter_args['limit'] = 100
-
-    messages_data = []
-    media_messages = []
-    
-    count = 0
-    async for msg in client.iter_messages(**iter_args):
-        # Save Message Data
-        msg_dict = {
-            'id': msg.id,
-            'date': msg.date,
-            'message': msg.message,
-            'sender_id': msg.sender_id,
-            'reply_to': msg.reply_to_msg_id if msg.reply_to else None,
-        }
-        messages_data.append(msg_dict)
-
-        # Check for Media
-        if msg.media:
-            media_messages.append(msg)
-        
-        count += 1
-        if count % 100 == 0:
-            print(f"Fetched {count} messages...", end='\r')
-    
-    print(f"\nTotal fetched: {count} messages.")
-
-    # 3. Export HTML
-    print(f"Exporting {len(messages_data)} messages to HTML...")
-    if messages_data:
-        df = pd.DataFrame(messages_data)
-        
-        # Convert date to string for better display
-        if 'date' in df.columns:
-            df['date'] = df['date'].astype(str)
-
-        output_file = config['export_settings']['output_file']
-        # Force .html extension if not present
-        if not output_file.endswith('.html'):
-            output_file = os.path.splitext(output_file)[0] + '.html'
-
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        
-        # Simple HTML export with some styling
-        html_content = df.to_html(escape=False, index=False)
-        
-        # Wrap in a basic HTML5 template
-        full_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="UTF-8">
-            <title>Telegram Messages Export</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-                th {{ background-color: #f2f2f2; }}
-                tr:nth-child(even) {{ background-color: #f9f9f9; }}
-                img {{ max-width: 200px; }}
-            </style>
-        </head>
-        <body>
-            <h1>Exported Messages: {target.name}</h1>
-            <p>Total Messages: {len(messages_data)}</p>
-            {html_content}
-        </body>
-        </html>
-        """
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(full_html)
+            singles.append([msg])
             
-        print(f"Saved to {output_file}")
-    else:
-        print("No messages to export.")
+    all_groups = list(groups.values()) + singles
+    # Sort all groups by the date of their first message
+    all_groups.sort(key=lambda g: g[0].date)
+    
+    print(f"Identified {len(all_groups)} content groups (Albums + Singles).")
 
-    # 4. Download Media (Python Native)
+    # Selection Logic
+    print("\n--- Found Content Groups ---")
+    for idx, grp in enumerate(all_groups):
+        # Determine description for display
+        desc = ""
+        for m in grp:
+            if m.message:
+                desc = m.message.replace('\n', ' ')[:60] # Preview
+                break
+        if not desc:
+            desc = "<No Description>"
+        
+        date_str = grp[0].date.strftime('%Y-%m-%d %H:%M')
+        file_count = len([m for m in grp if m.media])
+        print(f"{idx+1}. [{date_str}] {desc} ({file_count} files)")
+
+    selection = input("\nEnter numbers to download (e.g. 1,3,5-7) or 'all' [default: all]: ").strip()
+    
+    selected_groups = []
+    if not selection or selection.lower() == 'all':
+        selected_groups = all_groups
+    else:
+        try:
+            indices = set()
+            parts = selection.split(',')
+            for p in parts:
+                p = p.strip()
+                if '-' in p:
+                    start, end = map(int, p.split('-'))
+                    indices.update(range(start, end + 1))
+                elif p.isdigit():
+                    indices.add(int(p))
+            
+            selected_groups = [all_groups[i-1] for i in indices if 0 < i <= len(all_groups)]
+            # Restore order
+            selected_groups.sort(key=lambda g: all_groups.index(g))
+        except ValueError:
+            print("Invalid input format. Downloading all.")
+            selected_groups = all_groups
+
+    if not selected_groups:
+        print("No groups selected using current filter. Exiting.")
+        return
+
+    print(f"\nQueuing download for {len(selected_groups)} groups...")
+
+    # 6. Download
     dl_cfg = config['download_settings']
-    if media_messages and dl_cfg['max_concurrent_downloads'] > 0:
-        print(f"\nStarting download of {len(media_messages)} media items...")
-        
-        dl_path = dl_cfg['download_path']
-        os.makedirs(dl_path, exist_ok=True)
-        
-        sem = asyncio.Semaphore(dl_cfg['max_concurrent_downloads'])
-        
-        tasks = [download_media_safe(client, m, dl_path, sem) for m in media_messages]
-        # Sort by size (Smallest first)
-        # Messages without file info or size 0 will come first, which is fine
-        print("Sorting files by size (Smallest first)...")
-        media_messages.sort(key=lambda m: m.file.size if (m.file and hasattr(m.file, 'size')) else 0)
+    concurrency = dl_cfg.get('max_concurrent_downloads', 3)
+    base_path = dl_cfg.get('download_path', './output/downloads')
+    
+    print(f"Starting download to {base_path} (Concurrency: {concurrency})...")
+    
+    sem = asyncio.Semaphore(concurrency)
+    
+    # Process groups sequentially? Or parallelize groups?
+    # Parallelizing files within groups is handled in process_media_group
+    # Let's process groups sequentially to keep log readable, or maybe limit group parallelism.
+    # Given the requirements, downloading in parallel is key.
+    # We pass the semaphore down to the file downloads. 
+    # We can kick off all groups, but let the semaphore limit active file downloads.
+    
+    tasks = [process_media_group(client, grp, base_path, sem) for grp in selected_groups]
+    
+    # Use tqdm for overall progress
+    for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing Groups"):
+        await f
 
-        dl_path = dl_cfg['download_path']
-        os.makedirs(dl_path, exist_ok=True)
-        
-        sem = asyncio.Semaphore(dl_cfg['max_concurrent_downloads'])
-        
-        tasks = [download_media_safe(client, m, dl_path, sem) for m in media_messages]
-        
-        # Run tasks
-        # We use gather here to let individual progress bars handle the display
-        await asyncio.gather(*tasks)
-            
-    print("\nDone!")
+    print("\nAll operations completed!")
 
 if __name__ == '__main__':
     print_banner()
     with client:
         client.loop.run_until_complete(main())
+
